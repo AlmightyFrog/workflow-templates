@@ -1,0 +1,85 @@
+name: docker-cleanup
+
+on:
+  workflow_call:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: prune
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -f build.env ]; then set -a; . ./build.env; set +a; fi
+          : "${IMAGE:?set IMAGE= in build.env}"
+          GH_TOKEN="$TOKEN" python3 - <<'PY'
+          import datetime as dt, json, os, re, subprocess, sys
+          from collections import defaultdict
+
+          repo, image = os.environ["REPO"], os.environ["IMAGE"]
+          pkg = f"repos/{repo}/packages/container/{image}"
+          today = dt.date.today()
+          cutoff = today - dt.timedelta(days=int(os.environ.get("RETENTION_DAYS", "30")))
+          dated = re.compile(r"^(?:(?P<pre>.+)-)?(?P<day>\d{4}-\d{2}-\d{2})$")
+
+          api = subprocess.run(["gh", "api", f"{pkg}/versions?per_page=100", "--paginate", "--slurp"],
+                               capture_output=True, text=True)
+          if api.returncode:
+              if "404" in api.stderr or "Not Found" in api.stderr:
+                  print("package not found, nothing to prune")
+                  raise SystemExit(0)
+              print("failed to list versions:", api.stderr.strip(), file=sys.stderr)
+              raise SystemExit(1)
+          versions = [v for page in json.loads(api.stdout or "[[]]") for v in page]
+
+          months, years, drop = defaultdict(list), defaultdict(list), []
+          for v in versions:
+              tags = v.get("metadata", {}).get("container", {}).get("tags") or []
+              if not tags:
+                  continue
+              made = dt.datetime.fromisoformat(v["created_at"].replace("Z", "+00:00")).date()
+              if any(t.startswith("pr-") for t in tags):
+                  if made < cutoff:
+                      drop.append((v["id"], ",".join(tags)))
+                  continue
+              hit = [dated.match(t) for t in tags]
+              if not all(hit):
+                  continue
+              # longest match is the branch+dated tag; a moving tag is a different string
+              best = max(hit, key=lambda m: len(m.group(0)))
+              others = [t for t, m in zip(tags, hit) if t != best.group(0)]
+              pre = best.groupdict().get("pre") or ""
+              day = dt.date.fromisoformat(best.group("day"))
+              if any(o not in (pre, f"{pre}-{day}") for o in others):
+                  continue
+              if (day.year, day.month) == (today.year, today.month):
+                  continue
+              if day.year == today.year:
+                  months[(pre, day.year, day.month)].append((day, v["id"], tags))
+              else:
+                  years[(pre, day.year)].append((day, v["id"], tags))
+
+          for bucket in (months, years):
+              for items in bucket.values():
+                  for _, vid, tags in sorted(items)[1:]:
+                      drop.append((vid, ",".join(tags)))
+
+          failed = 0
+          for vid, tags in drop:
+              res = subprocess.run(["gh", "api", "-X", "DELETE", f"{pkg}/versions/{vid}"],
+                                   capture_output=True, text=True)
+              if res.returncode:
+                  failed += 1
+                  print(f"FAILED {vid} {tags}: {res.stderr.strip()}", file=sys.stderr)
+              else:
+                  print(f"deleted {vid} {tags}")
+          print(f"pruned {len(drop) - failed} of {len(versions)} versions")
+          raise SystemExit(1 if failed else 0)
+          PY

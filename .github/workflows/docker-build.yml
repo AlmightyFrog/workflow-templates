@@ -1,0 +1,52 @@
+name: docker-build
+
+on:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + push
+        env:
+          OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -f build.env ]; then set -a; . ./build.env; set +a; fi
+          : "${IMAGE:?set IMAGE= in build.env}"
+          read -r IMG T1 T2 < <(python3 - <<'PY'
+          import os, datetime, re
+          img = f"ghcr.io/{os.environ['OWNER'].lower()}/{os.environ['IMAGE']}"
+          date = datetime.date.today().isoformat()
+          pr = os.environ.get("PR_NUMBER", "")
+          branch = os.environ.get("REF_NAME", "")
+          branch = re.sub(r"[^A-Za-z0-9._-]", "-", branch)[:128].strip("-_")
+          if pr:
+              t1 = f"{img}:pr-{pr}"
+              t2 = f"{img}:pr-{pr}-{os.environ['SHA'][:7]}"
+          elif branch in ("", os.environ["DEFAULT_BRANCH"]):
+              t1, t2 = f"{img}:latest", f"{img}:{date}"
+          else:
+              t1, t2 = f"{img}:{branch}", f"{img}:{branch}-{date}"
+          print(img, t1, t2)
+          PY
+          )
+          PLATFORMS="${PLATFORMS:-linux/amd64}"
+          [ "$PLATFORMS" = "linux/amd64" ] || docker run --privileged --rm tonistiigi/binfmt --install arm64
+          docker buildx create --use
+          echo "$TOKEN" | docker login ghcr.io -u "$OWNER" --password-stdin
+          docker buildx build --push --provenance=false --platform "$PLATFORMS" \
+              --tag "$T1" --tag "$T2" "${CONTEXT:-.}"
